@@ -1,0 +1,7 @@
+/pkgr
+/src/*.o
+/src/*.d
+/tests/src/*.o
+/tests/src/*.d
+/*.pkgr.tar.gz
+/build/
