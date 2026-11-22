@@ -1,6 +1,6 @@
 # pkgr
 
-pkgr is a C package manager for Lunarix. It builds trusted local source recipes
+pkgr is a C package manager for [Lunarix](github.com/lunarixos/pkgr). It builds trusted local source recipes
 and installs binary packages from a file or a local directory repository. Both
 paths use the same compressed tar format and installed-package database.
 
