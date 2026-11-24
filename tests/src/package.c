@@ -45,7 +45,10 @@ bool valid_token(const char *text)
 
 static bool valid_path(const char *path)
 {
-    if (strncmp(path, "usr/", 4) || strlen(path) >= PATH_MAX)
+    if (strlen(path) >= PATH_MAX)
+        return false;
+    if (strncmp(path, "usr/", 4) && strncmp(path, "etc/", 4) &&
+        strncmp(path, "bin/", 4) && strncmp(path, "sbin/", 5) && strncmp(path, "lib/", 4))
         return false;
     for (const char *part = path; ; ) {
         size_t length = strcspn(part, "/");
@@ -106,11 +109,67 @@ static void sort_files(struct package *pkg)
             fail("duplicate package path: %s", pkg->files[i].path);
 }
 
-bool pkg_has_file(const struct package *pkg, const char *path)
+const struct package_file *pkg_file(const struct package *pkg, const char *path)
 {
     struct package_file key = {(char *)path, 0};
-    return pkg->file_count &&
-           bsearch(&key, pkg->files, pkg->file_count, sizeof(*pkg->files), compare_files);
+    return pkg->file_count ?
+           bsearch(&key, pkg->files, pkg->file_count, sizeof(*pkg->files), compare_files) : NULL;
+}
+
+bool pkg_has_file(const struct package *pkg, const char *path)
+{
+    return pkg_file(pkg, path) != NULL;
+}
+
+struct package_requirement pkg_requirement(const char *expression)
+{
+    struct package_requirement requirement = {0};
+    size_t length = strcspn(expression, "<>=");
+    if (length >= sizeof(requirement.name))
+        fail("invalid dependency: %s", expression);
+    memcpy(requirement.name, expression, length);
+    if (!valid_token(requirement.name))
+        fail("invalid dependency: %s", expression);
+    const char *op = expression + length;
+    if (*op) {
+        requirement.minimum = !strncmp(op, ">=", 2);
+        if (!requirement.minimum && *op != '=')
+            fail("use name, name>=version or name=version for dependency: %s", expression);
+        requirement.version = op + (requirement.minimum ? 2 : 1);
+        if (!valid_token(requirement.version))
+            fail("invalid dependency version: %s", expression);
+    }
+    return requirement;
+}
+
+bool pkg_satisfies(struct package_requirement requirement, const char *version)
+{
+    if (!version)
+        return false;
+    if (!requirement.version)
+        return true;
+    int comparison = strverscmp(version, requirement.version);
+    return requirement.minimum ? comparison >= 0 : comparison == 0;
+}
+
+struct package_config *pkg_config(const struct package *pkg, const char *path)
+{
+    for (size_t i = 0; i < pkg->config_count; ++i)
+        if (!strcmp(pkg->configs[i].path, path))
+            return &pkg->configs[i];
+    return NULL;
+}
+
+static void add_config(struct package *pkg, const char *path, const char *digest)
+{
+    if (strncmp(path, "etc/", 4) || !valid_path(path) ||
+        pkg_config(pkg, path) || pkg->config_count >= 256)
+        fail("invalid configuration path: %s", path);
+    pkg->configs = grow_array(pkg->configs, pkg->config_count + 1, sizeof(*pkg->configs));
+    struct package_config *config = &pkg->configs[pkg->config_count++];
+    *config = (struct package_config){ .path = copy_string(path) };
+    if (digest)
+        memcpy(config->digest, digest, 64);
 }
 
 void pkg_parse(FILE *stream, struct package *pkg, bool record)
@@ -137,12 +196,21 @@ void pkg_parse(FILE *stream, struct package *pkg, bool record)
             set_field(&pkg->arch, value, line);
         else if (!strcmp(line, "description"))
             set_field(&pkg->description, value, line);
-        else if (!strcmp(line, "depend")) {
-            if (!valid_token(value) || pkg->dependency_count >= 256)
-                fail("invalid dependency: %s", value);
+        else if (!strcmp(line, "essential") && !strcmp(value, "yes") && !pkg->essential)
+            pkg->essential = true;
+        else if (!strcmp(line, "config"))
+            add_config(pkg, value, NULL);
+        else if (record && !strcmp(line, "config-digest")) {
+            if (strspn(value, "0123456789abcdef") != 64 || value[64] != ' ')
+                fail("invalid configuration digest");
+            add_config(pkg, value + 65, value);
+        } else if (!strcmp(line, "depend")) {
+            struct package_requirement requirement = pkg_requirement(value);
+            if (pkg->dependency_count >= 256)
+                fail("too many dependencies");
             for (size_t i = 0; i < pkg->dependency_count; ++i)
-                if (!strcmp(pkg->depends[i], value))
-                    fail("duplicate dependency: %s", value);
+                if (!strcmp(pkg_requirement(pkg->depends[i]).name, requirement.name))
+                    fail("duplicate dependency: %s", requirement.name);
             pkg->depends = grow_array(pkg->depends, pkg->dependency_count + 1,
                                       sizeof(*pkg->depends));
             pkg->depends[pkg->dependency_count++] = copy_string(value);
@@ -157,7 +225,7 @@ void pkg_parse(FILE *stream, struct package *pkg, bool record)
     if (!valid_token(pkg->name) || !valid_token(pkg->version) || !valid_token(pkg->arch))
         fail("manifest requires a valid name, version and arch");
     for (size_t i = 0; i < pkg->dependency_count; ++i)
-        if (!strcmp(pkg->name, pkg->depends[i]))
+        if (!strcmp(pkg->name, pkg_requirement(pkg->depends[i]).name))
             fail("package depends on itself: %s", pkg->name);
     sort_files(pkg);
 }
@@ -169,6 +237,15 @@ void pkg_write(FILE *stream, const struct package *pkg, bool record)
         fprintf(stream, "description=%s\n", pkg->description);
     for (size_t i = 0; i < pkg->dependency_count; ++i)
         fprintf(stream, "depend=%s\n", pkg->depends[i]);
+    if (pkg->essential)
+        fputs("essential=yes\n", stream);
+    for (size_t i = 0; i < pkg->config_count; ++i) {
+        const struct package_config *config = &pkg->configs[i];
+        if (record && *config->digest)
+            fprintf(stream, "config-digest=%s %s\n", config->digest, config->path);
+        else
+            fprintf(stream, "config=%s\n", config->path);
+    }
     if (record && pkg->file_count) {
         const char **paths = grow_array(NULL, pkg->file_count, sizeof(*paths));
         for (size_t i = 0; i < pkg->file_count; ++i)
@@ -203,6 +280,9 @@ void pkg_free(struct package *pkg)
     free(pkg->version);
     free(pkg->arch);
     free(pkg->description);
+    for (size_t i = 0; i < pkg->config_count; ++i)
+        free(pkg->configs[i].path);
+    free(pkg->configs);
     for (size_t i = 0; i < pkg->dependency_count; ++i)
         free(pkg->depends[i]);
     free(pkg->depends);
@@ -248,6 +328,16 @@ static void read_header(struct archive *archive, struct package *pkg)
     fclose(stream);
 }
 
+static bool permitted_mode(const struct package *pkg, const char *path, mode_t mode)
+{
+    mode &= 07777;
+    if (!(mode & 07000))
+        return true;
+    return mode == 04755 &&
+           ((!strcmp(pkg->name, "opendoas") && !strcmp(path, "usr/bin/doas")) ||
+            (!strcmp(pkg->name, "sudo") && !strcmp(path, "usr/bin/sudo")));
+}
+
 void pkg_read(const char *path, struct package *pkg, int stage, bool metadata_only)
 {
     struct archive *archive = archive_read_new();
@@ -271,13 +361,23 @@ void pkg_read(const char *path, struct package *pkg, int stage, bool metadata_on
             mode_t mode = archive_entry_perm(entry);
             if (!filename)
                 fail("archive entry has no path");
-            if (archive_entry_filetype(entry) != AE_IFREG || archive_entry_hardlink(entry) ||
-                archive_entry_symlink(entry) || (mode & 07000) || archive_entry_size(entry) < 0 ||
+            mode_t type = archive_entry_filetype(entry);
+            if ((type != AE_IFREG && type != AE_IFLNK) || archive_entry_hardlink(entry) ||
+                (type != AE_IFLNK && archive_entry_symlink(entry)) ||
+                !permitted_mode(pkg, filename, mode) || archive_entry_size(entry) < 0 ||
                 archive_entry_sparse_count(entry) != 0)
                 fail("unsupported archive entry: %s", filename);
             add_file(pkg, filename);
             char name[32];
             pkg_slot(name, "new", pkg->file_count - 1);
+            if (type == AE_IFLNK) {
+                const char *target = archive_entry_symlink(entry);
+                if (!target || !*target || strlen(target) >= PATH_MAX || pkg_config(pkg, filename))
+                    fail("invalid symbolic link: %s", filename);
+                if (symlinkat(target, stage, name) != 0)
+                    syserror("stage symbolic link", filename);
+                continue;
+            }
             int fd = openat(stage, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
             if (fd < 0)
                 syserror("stage", filename);
@@ -297,6 +397,9 @@ void pkg_read(const char *path, struct package *pkg, int stage, bool metadata_on
         if (!pkg->file_count)
             fail("package has no files");
         sort_files(pkg);
+        for (size_t i = 0; i < pkg->config_count; ++i)
+            if (!pkg_has_file(pkg, pkg->configs[i].path))
+                fail("configuration file missing from archive: %s", pkg->configs[i].path);
     }
     check_archive(archive, archive_read_close(archive), "close package");
     archive_read_free(archive);
@@ -322,15 +425,16 @@ static void archive_bytes(struct archive *archive, const void *data, size_t leng
         fail("write package payload: %s", archive_error_string(archive));
 }
 
-static void archive_file(struct archive *archive, const char *path, const char *relative)
+static void archive_file(struct archive *archive, const struct package *pkg,
+                         const char *path, const char *relative)
 {
     int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     struct stat st;
     if (fd < 0 || fstat(fd, &st) < 0)
         syserror("open", path);
-    if (!S_ISREG(st.st_mode) || (st.st_mode & 07000))
+    if (!S_ISREG(st.st_mode) || !permitted_mode(pkg, relative, st.st_mode))
         fail("unsupported staged file: %s", relative);
-    write_header(archive, relative, st.st_mode & 0777, st.st_size);
+    write_header(archive, relative, st.st_mode & 07777, st.st_size);
     char buffer[32768];
     off_t left = st.st_size;
     while (left > 0) {
@@ -347,6 +451,25 @@ static void archive_file(struct archive *archive, const char *path, const char *
     }
     close(fd);
     check_archive(archive, archive_write_finish_entry(archive), relative);
+}
+
+static void archive_link(struct archive *archive, const char *path, const char *relative)
+{
+    char target[PATH_MAX];
+    ssize_t length = readlink(path, target, sizeof(target));
+    if (length < 0)
+        syserror("read symbolic link", relative);
+    if ((size_t)length >= sizeof(target))
+        fail("symbolic link target too long: %s", relative);
+    target[length] = '\0';
+    struct archive_entry *entry = archive_entry_new();
+    archive_entry_set_pathname(entry, relative);
+    archive_entry_set_filetype(entry, AE_IFLNK);
+    archive_entry_set_perm(entry, 0777);
+    archive_entry_set_size(entry, 0);
+    archive_entry_set_symlink(entry, target);
+    check_archive(archive, archive_write_header(archive, entry), relative);
+    archive_entry_free(entry);
 }
 
 char *pkg_pack(const char *manifest, const char *root)
@@ -409,22 +532,34 @@ char *pkg_pack(const char *manifest, const char *root)
             syserror("read stage", entry->fts_path);
         }
         if (entry->fts_info == FTS_D) {
-            if (entry->fts_level && strcmp(entry->fts_path + prefix, "usr") &&
-                !valid_path(entry->fts_path + prefix))
+            const char *relative = entry->fts_level ? entry->fts_path + prefix : "";
+            if (entry->fts_level &&
+                strcmp(relative, "usr") && strcmp(relative, "etc") &&
+                strcmp(relative, "bin") && strcmp(relative, "sbin") &&
+                strcmp(relative, "lib") && !valid_path(relative))
                 fail("invalid stage directory: %s", entry->fts_path);
             continue;
         }
         if (entry->fts_info == FTS_DP)
             continue;
-        if (entry->fts_level == 0 || entry->fts_info != FTS_F)
+        const char *relative = entry->fts_path + prefix;
+        add_file(&pkg, relative);
+        if (entry->fts_info == FTS_F)
+            archive_file(archive, &pkg, entry->fts_accpath, relative);
+        else if ((entry->fts_info == FTS_SL || entry->fts_info == FTS_SLNONE) &&
+                 !pkg_config(&pkg, relative))
+            archive_link(archive, entry->fts_accpath, relative);
+        else
             fail("unsupported stage entry: %s", entry->fts_path);
-        add_file(&pkg, entry->fts_path + prefix);
-        archive_file(archive, entry->fts_accpath, entry->fts_path + prefix);
     }
     fts_close(tree);
     free(canonical);
     if (!pkg.file_count)
         fail("stage has no package files");
+    sort_files(&pkg);
+    for (size_t i = 0; i < pkg.config_count; ++i)
+        if (!pkg_has_file(&pkg, pkg.configs[i].path))
+            fail("configuration file missing from stage: %s", pkg.configs[i].path);
     check_archive(archive, archive_write_close(archive), "finish package");
     archive_write_free(archive);
     if (fchmod(fd, 0644) != 0)
@@ -450,6 +585,11 @@ char *pkg_build(const char *recipe)
         const char *recipes = getenv("PKGR_RECIPES");
         char *path = path_join(recipes && *recipes ? recipes : "packages", recipe);
         directory = realpath(path, NULL);
+        if (!directory && errno == ENOENT && (!recipes || !*recipes)) {
+            free(path);
+            path = path_join("/usr/share/pkgr/recipes", recipe);
+            directory = realpath(path, NULL);
+        }
         free(path);
     }
     if (!directory)

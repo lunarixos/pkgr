@@ -13,6 +13,7 @@
 #define RECORD_SUFFIX ".record"
 #define PREPARE ".prepare"
 #define PENDING ".pending"
+#define BATCH ".batch"
 #define DONE ".done"
 
 static int pkg_parent(int root, const char *path, bool create, char name[NAME_MAX + 1])
@@ -90,7 +91,12 @@ static void clear_work(int db, const char *name)
     for (struct dirent *entry; (entry = next_entry(dir)); ) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
             continue;
-        if (unlinkat(fd, entry->d_name, 0) != 0)
+        struct stat st;
+        if (fstatat(fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0)
+            syserror("inspect transaction file", entry->d_name);
+        if (S_ISDIR(st.st_mode))
+            clear_work(fd, entry->d_name);
+        else if (unlinkat(fd, entry->d_name, 0) != 0)
             syserror("clean transaction file", entry->d_name);
     }
     closedir(dir);
@@ -186,10 +192,10 @@ static void replace_record(int db, int work, const char *name, const struct pack
     sync_fd(db, name);
 }
 
-static void finish_work(int db)
+static void finish_work(int db, const char *pending)
 {
-    if (renameat(db, PENDING, db, DONE) != 0)
-        syserror("finish transaction", PENDING);
+    if (renameat(db, pending, db, DONE) != 0)
+        syserror("finish transaction", pending);
     sync_fd(db, DONE);
     clear_work(db, DONE);
 }
@@ -243,6 +249,33 @@ static void rollback(struct database db, int work)
     pkg_free(&after);
 }
 
+static int batch_package(int batch, size_t index, bool create)
+{
+    char slot[32];
+    pkg_slot(slot, "pkg", index);
+    if (create && mkdirat(batch, slot, 0700) != 0)
+        syserror("create package stage", slot);
+    int work = open_work(batch, slot);
+    if (work < 0)
+        fail("missing package stage %s", slot);
+    return work;
+}
+
+static void rollback_batch(struct database db, int batch)
+{
+    size_t count = 0;
+    DIR *dir = entries_at(batch);
+    for (struct dirent *entry; (entry = next_entry(dir)); )
+        if (entry->d_name[0] != '.')
+            ++count;
+    closedir(dir);
+    while (count) {
+        int work = batch_package(batch, --count, false);
+        rollback(db, work);
+        close(work);
+    }
+}
+
 struct database db_open(const char *path, bool create)
 {
     struct database db = {open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC), -1};
@@ -260,7 +293,13 @@ struct database db_open(const char *path, bool create)
     if (work >= 0) {
         rollback(db, work);
         close(work);
-        finish_work(db.dir);
+        finish_work(db.dir, PENDING);
+    }
+    work = open_work(db.dir, BATCH);
+    if (work >= 0) {
+        rollback_batch(db, work);
+        close(work);
+        finish_work(db.dir, BATCH);
     }
     return db;
 }
@@ -272,13 +311,23 @@ void db_close(struct database db)
     close(db.root);
 }
 
-static void check_dependencies(int dir, const struct package *pkg)
+static void check_dependencies(struct database db, const struct package *pkg,
+                               const struct package *planned, size_t count)
 {
     for (size_t i = 0; i < pkg->dependency_count; ++i) {
-        struct package dependency = {0};
-        if (!installed(dir, pkg->depends[i], &dependency))
-            fail("%s requires installed package %s", pkg->name, pkg->depends[i]);
-        pkg_free(&dependency);
+        struct package_requirement requirement = pkg_requirement(pkg->depends[i]);
+        struct package installed = {0};
+        const char *version = NULL;
+        for (size_t j = 0; j < count; ++j)
+            if (!strcmp(planned[j].name, requirement.name)) {
+                version = planned[j].version;
+                break;
+            }
+        if (!version && db_installed(db, requirement.name, &installed))
+            version = installed.version;
+        if (!pkg_satisfies(requirement, version))
+            fail("%s requires %s", pkg->name, pkg->depends[i]);
+        pkg_free(&installed);
     }
 }
 
@@ -292,7 +341,7 @@ static void check_dependents(int db, const char *name)
         if (!read_record(db, entry->d_name, &pkg))
             fail("package record disappeared: %s", entry->d_name);
         for (size_t i = 0; i < pkg.dependency_count; ++i)
-            if (!strcmp(pkg.depends[i], name))
+            if (!strcmp(pkg_requirement(pkg.depends[i]).name, name))
                 fail("%s is required by %s", name, pkg.name);
         pkg_free(&pkg);
     }
@@ -327,17 +376,6 @@ static int prepare_work(struct database db)
     return fd;
 }
 
-static bool probe_file(int root, const char *path, struct stat *st)
-{
-    char name[NAME_MAX + 1];
-    int parent = pkg_parent(root, path, false, name);
-    if (parent < 0)
-        return false;
-    bool exists = path_status(parent, name, st);
-    close(parent);
-    return exists;
-}
-
 static void validate_parents(const struct package *pkg, const char *path)
 {
     char buffer[PATH_MAX];
@@ -346,6 +384,42 @@ static void validate_parents(const struct package *pkg, const char *path)
         *slash = '\0';
         if (pkg_has_file(pkg, buffer))
             fail("archive uses a file as a directory: %s", buffer);
+    }
+}
+
+static void digest_at(int dir, const char *name, char digest[65])
+{
+    int fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0)
+        syserror("read configuration", name);
+    char path[80];
+    snprintf(path, sizeof(path), "/proc/%ld/fd/%d", (long)getpid(), fd);
+    file_digest(path, digest);
+    close(fd);
+}
+
+static bool config_modified(int parent, const char *name, const struct stat *st,
+                            const struct package_config *config)
+{
+    if (!config)
+        return false;
+    if (!S_ISREG(st->st_mode) || !*config->digest)
+        return true;
+    char digest[65];
+    digest_at(parent, name, digest);
+    return strcmp(digest, config->digest) != 0;
+}
+
+static void config_digests(struct package *pkg, int work)
+{
+    for (size_t i = 0; i < pkg->file_count; ++i) {
+        const struct package_file *file = &pkg->files[i];
+        struct package_config *config = pkg_config(pkg, file->path);
+        if (config) {
+            char slot[32];
+            pkg_slot(slot, "new", file->slot);
+            digest_at(work, slot, config->digest);
+        }
     }
 }
 
@@ -359,8 +433,13 @@ static void backup_files(int root, int work, const struct package *pkg)
             continue;
         struct stat st;
         if (path_status(parent, name, &st)) {
-            if (!S_ISREG(st.st_mode))
-                fail("managed path is no longer a regular file: %s", file->path);
+            if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode))
+                fail("unsupported file at managed path: %s", file->path);
+            if (config_modified(parent, name, &st, pkg_config(pkg, file->path))) {
+                printf("Preserved modified configuration %s\n", file->path);
+                close(parent);
+                continue;
+            }
             pkg_slot(backup, "old", file->slot);
             if (linkat(parent, name, work, backup, 0) != 0)
                 syserror("back up", file->path);
@@ -369,26 +448,61 @@ static void backup_files(int root, int work, const struct package *pkg)
     }
 }
 
-static void unlink_old(int root, int work, const struct package_file *file)
+static void update_files(struct database db, int work, const struct package *before,
+                         const struct package *after)
 {
-    char name[NAME_MAX + 1], backup[32];
-    pkg_slot(backup, "old", file->slot);
-    struct stat saved, current;
-    if (!path_status(work, backup, &saved))
-        return;
-    int parent = pkg_parent(root, file->path, false, name);
-    if (parent < 0 || !path_status(parent, name, &current) || !same_file(&current, &saved))
-        fail("managed path changed during transaction: %s", file->path);
-    if (unlinkat(parent, name, 0) != 0)
-        syserror("remove", file->path);
-    sync_fd(parent, file->path);
-    close(parent);
+    for (size_t i = 0; i < after->file_count; ++i) {
+        const struct package_file *file = &after->files[i];
+        char name[NAME_MAX + 1], staged[32];
+        int parent = pkg_parent(db.root, file->path, true, name);
+        pkg_slot(staged, "new", file->slot);
+        struct stat current;
+        if (path_status(parent, name, &current)) {
+            const struct package_file *old = pkg_file(before, file->path);
+            if (!old)
+                fail("file already exists: %s", file->path);
+            char backup[32];
+            pkg_slot(backup, "old", old->slot);
+            struct stat saved;
+            if (!path_status(work, backup, &saved)) {
+                if (!pkg_config(before, file->path))
+                    fail("managed path changed during transaction: %s", file->path);
+                close(parent);
+                continue;
+            }
+            if (!same_file(&current, &saved))
+                fail("managed path changed during transaction: %s", file->path);
+            if (linkat(work, staged, work, "replace", 0) != 0 ||
+                renameat(work, "replace", parent, name) != 0)
+                syserror("replace", file->path);
+        } else if (linkat(work, staged, parent, name, 0) != 0)
+            syserror("install", file->path);
+        sync_fd(parent, file->path);
+        close(parent);
+    }
+
+    for (size_t i = 0; i < before->file_count; ++i) {
+        const struct package_file *file = &before->files[i];
+        char name[NAME_MAX + 1], backup[32];
+        struct stat saved, current;
+        if (pkg_has_file(after, file->path))
+            continue;
+        pkg_slot(backup, "old", file->slot);
+        if (!path_status(work, backup, &saved))
+            continue;
+        int parent = pkg_parent(db.root, file->path, false, name);
+        if (parent < 0 || !path_status(parent, name, &current) || !same_file(&current, &saved))
+            fail("managed path changed during transaction: %s", file->path);
+        if (unlinkat(parent, name, 0) != 0)
+            syserror("remove", file->path);
+        sync_fd(parent, file->path);
+        close(parent);
+    }
 }
 
-static void apply(struct database db, int work, const struct package *before,
-                  const struct package *after)
+static void prepare_records(struct database db, int work, const struct package *before,
+                            const struct package *after)
 {
-    const char *name = after->name ? after->name : before->name;
     if (before->name) {
         write_record(work, "before", before);
         backup_files(db.root, work, before);
@@ -396,65 +510,195 @@ static void apply(struct database db, int work, const struct package *before,
     if (after->name)
         write_record(work, "after", after);
     sync_fd(work, PREPARE);
-
-    // A pending transaction always rolls back. Renaming it to done commits it.
-    if (renameat(db.dir, PREPARE, db.dir, PENDING) != 0)
-        syserror("start transaction for", name);
-    sync_fd(db.dir, PENDING);
-
-    for (size_t i = 0; i < before->file_count; ++i)
-        unlink_old(db.root, work, &before->files[i]);
-    for (size_t i = 0; i < after->file_count; ++i) {
-        const struct package_file *file = &after->files[i];
-        char filename[NAME_MAX + 1], staged[32];
-        int parent = pkg_parent(db.root, file->path, true, filename);
-        pkg_slot(staged, "new", file->slot);
-        if (linkat(work, staged, parent, filename, 0) != 0)
-            syserror("install", file->path);
-        sync_fd(parent, file->path);
-        close(parent);
-    }
-    replace_record(db.dir, work, name, after);
-    finish_work(db.dir);
 }
 
-void db_install(struct database db, const char *path, const char *expected, bool upgrade)
+static void start_work(struct database db, const char *pending)
 {
-    if (db.dir < 0)
-        fail("no packages installed in this root");
-    struct package before = {0}, after = {0};
-    int work = prepare_work(db);
-    pkg_read(path, &after, work, false);
-    if (expected && strcmp(expected, after.name))
-        fail("expected %s but archive contains %s", expected, after.name);
+    if (renameat(db.dir, PREPARE, db.dir, pending) != 0)
+        syserror("start transaction", pending);
+    sync_fd(db.dir, pending);
+}
 
+bool db_installed(struct database db, const char *name, struct package *pkg)
+{
+    return db.dir >= 0 && installed(db.dir, name, pkg);
+}
+
+void db_check_install(struct database db, const struct package *pkg,
+                      struct package *before, bool upgrade)
+{
     struct utsname platform;
     if (uname(&platform) != 0)
         syserror("read", "machine architecture");
-    if (strcmp(after.arch, platform.machine) && strcmp(after.arch, "noarch"))
-        fail("package architecture %s does not match %s", after.arch, platform.machine);
-    bool exists = installed(db.dir, after.name, &before);
+    if (strcmp(pkg->arch, platform.machine) && strcmp(pkg->arch, "noarch"))
+        fail("package architecture %s does not match %s", pkg->arch, platform.machine);
+
+    bool exists = db_installed(db, pkg->name, before);
     if (upgrade) {
         if (!exists)
-            fail("%s is not installed", after.name);
-        if (strverscmp(after.version, before.version) <= 0)
-            fail("%s %s is not newer than %s", after.name, after.version, before.version);
+            fail("%s is not installed", pkg->name);
+        if (strverscmp(pkg->version, before->version) <= 0)
+            fail("%s %s is not newer than %s", pkg->name, pkg->version, before->version);
     } else if (exists)
-        fail("%s is already installed; use 'pkgr upgrade FILE'", after.name);
+        fail("%s is already installed; use 'pkgr upgrade FILE'", pkg->name);
+}
 
-    check_dependencies(db.dir, &after);
-    check_owners(db.dir, &after);
-    for (size_t i = 0; i < after.file_count; ++i) {
-        const char *file = after.files[i].path;
+static void preflight_files(struct database db, const struct package *before,
+                            const struct package *after)
+{
+    struct stat database;
+    if (fstat(db.dir, &database) != 0)
+        syserror("stat", "package database");
+    for (size_t i = 0; i < after->file_count; ++i) {
+        const char *file = after->files[i].path;
+        char name[NAME_MAX + 1];
         struct stat st;
-        validate_parents(&after, file);
-        if (probe_file(db.root, file, &st) && (!S_ISREG(st.st_mode) || !pkg_has_file(&before, file)))
+        validate_parents(after, file);
+        int parent = pkg_parent(db.root, file, false, name);
+        if (parent >= 0 && path_status(parent, name, &st) &&
+            ((!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) || !pkg_has_file(before, file)))
             fail("file already exists: %s", file);
+        char ancestor[PATH_MAX];
+        strcpy(ancestor, file);
+        while (parent < 0) {
+            *strrchr(ancestor, '/') = '\0';
+            parent = pkg_parent(db.root, ancestor, false, name);
+        }
+        if (fstat(parent, &st) != 0)
+            syserror("stat parent of", file);
+        if (database.st_dev != st.st_dev)
+            fail("package paths must be on the database filesystem: %s", file);
+        close(parent);
     }
-    apply(db, work, &before, &after);
+}
+
+static void check_batch(struct database db, const struct package *after, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        check_dependencies(db, &after[i], after, count);
+        for (size_t j = 0; j < count; ++j) {
+            if (i == j)
+                continue;
+            if (!strcmp(after[i].name, after[j].name))
+                fail("duplicate planned package: %s", after[i].name);
+            for (size_t k = 0; k < after[i].file_count; ++k) {
+                const char *path = after[i].files[k].path;
+                if (pkg_has_file(&after[j], path))
+                    fail("%s and %s both install %s", after[i].name, after[j].name, path);
+                validate_parents(&after[j], path);
+            }
+        }
+    }
+
+    size_t installed_count;
+    char **names = db_package_names(db, &installed_count);
+    for (size_t i = 0; i < installed_count; ++i) {
+        bool replaced = false;
+        for (size_t j = 0; j < count; ++j)
+            if (!strcmp(names[i], after[j].name))
+                replaced = true;
+        if (!replaced) {
+            struct package installed = {0};
+            if (!db_installed(db, names[i], &installed))
+                fail("package record disappeared: %s", names[i]);
+            check_dependencies(db, &installed, after, count);
+            pkg_free(&installed);
+        }
+        free(names[i]);
+    }
+    free(names);
+}
+
+void db_apply(struct database db, const struct package_change *changes, size_t count)
+{
+    if (!count)
+        return;
+    int batch = prepare_work(db);
+    struct package *before = calloc(count, sizeof(*before));
+    struct package *after = calloc(count, sizeof(*after));
+    if (!before || !after)
+        fail("out of memory");
+    for (size_t i = 0; i < count; ++i) {
+        int work = batch_package(batch, i, true);
+        pkg_read(changes[i].path, &after[i], work, false);
+        if (strcmp(changes[i].name, after[i].name) || strcmp(changes[i].version, after[i].version))
+            fail("package archive changed after planning: %s", changes[i].path);
+        db_check_install(db, &after[i], &before[i], changes[i].upgrade);
+        after[i].essential |= before[i].essential;
+        check_owners(db.dir, &after[i]);
+        preflight_files(db, &before[i], &after[i]);
+        config_digests(&after[i], work);
+        prepare_records(db, work, &before[i], &after[i]);
+        close(work);
+    }
+    check_batch(db, after, count);
+    sync_fd(batch, PREPARE);
+
+    start_work(db, BATCH);
+    for (size_t i = 0; i < count; ++i) {
+        int work = batch_package(batch, i, false);
+        update_files(db, work, &before[i], &after[i]);
+        replace_record(db.dir, work, after[i].name, &after[i]);
+        close(work);
+    }
+    finish_work(db.dir, BATCH);
+    close(batch);
+    for (size_t i = 0; i < count; ++i) {
+        printf("%s %s %s\n", changes[i].upgrade ? "Upgraded" : "Installed",
+               after[i].name, after[i].version);
+        pkg_free(&before[i]);
+        pkg_free(&after[i]);
+    }
+    free(before);
+    free(after);
+}
+
+static bool matching_files(int left_dir, const char *left_name, const struct stat *left,
+                           int right_dir, const char *right_name, const struct stat *right)
+{
+    if (S_ISLNK(left->st_mode) && S_ISLNK(right->st_mode)) {
+        char a[PATH_MAX], b[PATH_MAX];
+        ssize_t length = readlinkat(left_dir, left_name, a, sizeof(a));
+        ssize_t other = readlinkat(right_dir, right_name, b, sizeof(b));
+        return length >= 0 && length < PATH_MAX && length == other && !memcmp(a, b, length);
+    }
+    if (!S_ISREG(left->st_mode) || !S_ISREG(right->st_mode) ||
+        left->st_mode != right->st_mode || left->st_size != right->st_size)
+        return false;
+    char a[65], b[65];
+    digest_at(left_dir, left_name, a);
+    digest_at(right_dir, right_name, b);
+    return !strcmp(a, b);
+}
+
+void db_adopt(struct database db, const char *path)
+{
+    struct package before = {0}, after = {0};
+    int work = prepare_work(db);
+    pkg_read(path, &after, work, false);
+    db_check_install(db, &after, &before, false);
+    check_dependencies(db, &after, NULL, 0);
+    check_owners(db.dir, &after);
+    config_digests(&after, work);
+    for (size_t i = 0; i < after.file_count; ++i) {
+        const struct package_file *file = &after.files[i];
+        char name[NAME_MAX + 1], slot[32];
+        pkg_slot(slot, "new", file->slot);
+        int parent = pkg_parent(db.root, file->path, false, name);
+        struct stat current, staged;
+        if (parent < 0 || !path_status(parent, name, &current))
+            fail("cannot adopt missing file: %s", file->path);
+        if (!path_status(work, slot, &staged))
+            fail("missing adoption payload: %s", file->path);
+        if (!(pkg_config(&after, file->path) && S_ISREG(current.st_mode)) &&
+            !matching_files(parent, name, &current, work, slot, &staged))
+            fail("cannot adopt modified file: %s", file->path);
+        close(parent);
+    }
+    replace_record(db.dir, work, after.name, &after);
     close(work);
-    printf("%s %s %s\n", upgrade ? "Upgraded" : "Installed", after.name, after.version);
-    pkg_free(&before);
+    clear_work(db.dir, PREPARE);
+    printf("Adopted %s %s\n", after.name, after.version);
     pkg_free(&after);
 }
 
@@ -463,9 +707,15 @@ void db_remove(struct database db, const char *name)
     struct package before = {0}, empty = {0};
     if (db.dir < 0 || !installed(db.dir, name, &before))
         fail("%s is not installed", name);
+    if (before.essential || !strcmp(name, "pkgr"))
+        fail("%s is an essential system package", name);
     check_dependents(db.dir, name);
     int work = prepare_work(db);
-    apply(db, work, &before, &empty);
+    prepare_records(db, work, &before, &empty);
+    start_work(db, PENDING);
+    update_files(db, work, &before, &empty);
+    replace_record(db.dir, work, name, &empty);
+    finish_work(db.dir, PENDING);
     close(work);
     printf("Removed %s %s\n", before.name, before.version);
     pkg_free(&before);
@@ -477,26 +727,35 @@ static int compare_names(const void *left, const void *right)
     return strcmp(*a, *b);
 }
 
-void db_list(struct database db)
+char **db_package_names(struct database db, size_t *count)
 {
+    *count = 0;
     if (db.dir < 0)
-        return;
+        return NULL;
     DIR *dir = entries_at(db.dir);
     char **names = NULL;
-    size_t count = 0;
     for (struct dirent *entry; (entry = next_entry(dir)); ) {
         if (!has_suffix(entry->d_name, RECORD_SUFFIX))
             continue;
-        if ((count & (count - 1)) == 0)
-            names = grow_array(names, count ? count * 2 : 1, sizeof(*names));
-        names[count++] = copy_string(entry->d_name);
+        if ((*count & (*count - 1)) == 0)
+            names = grow_array(names, *count ? *count * 2 : 1, sizeof(*names));
+        char *name = copy_string(entry->d_name);
+        name[strlen(name) - strlen(RECORD_SUFFIX)] = '\0';
+        names[(*count)++] = name;
     }
     closedir(dir);
-    if (count > 1)
-        qsort(names, count, sizeof(*names), compare_names);
+    if (*count > 1)
+        qsort(names, *count, sizeof(*names), compare_names);
+    return names;
+}
+
+void db_list(struct database db)
+{
+    size_t count;
+    char **names = db_package_names(db, &count);
     for (size_t i = 0; i < count; ++i) {
         struct package pkg = {0};
-        if (!read_record(db.dir, names[i], &pkg))
+        if (!db_installed(db, names[i], &pkg))
             fail("package record disappeared: %s", names[i]);
         printf("%s %s\n", pkg.name, pkg.version);
         pkg_free(&pkg);

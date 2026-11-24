@@ -1,0 +1,6 @@
+name=base-devel
+version=0.1.0-1
+arch=x86_64
+description=Optional GCC and CMake development toolchain for Lunarix
+depend=git
+depend=make

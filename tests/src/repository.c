@@ -28,8 +28,10 @@ static struct dirent *next_package(DIR *dir)
     }
 }
 
-char *repo_find(const char *directory, const char *name)
+char *repo_find(const char *directory, struct package_requirement requirement,
+                const char *newer_than)
 {
+    const char *name = requirement.name;
     DIR *dir = open_repo(directory);
     struct utsname system;
     if (uname(&system) != 0)
@@ -40,7 +42,8 @@ char *repo_find(const char *directory, const char *name)
         char *path = path_join(directory, entry->d_name);
         struct package pkg = {0};
         pkg_read(path, &pkg, -1, true);
-        if (!strcmp(pkg.name, name) &&
+        if (!strcmp(pkg.name, name) && pkg_satisfies(requirement, pkg.version) &&
+            (!newer_than || strverscmp(pkg.version, newer_than) > 0) &&
             (!strcmp(pkg.arch, "noarch") || !strcmp(pkg.arch, system.machine))) {
             int order = version ? strverscmp(pkg.version, version) : 1;
             if (!order)
@@ -61,7 +64,7 @@ char *repo_find(const char *directory, const char *name)
     if (ambiguous)
         fail("ambiguous repository version: %s %s", name, version);
     free(version);
-    if (!result)
+    if (!result && !newer_than)
         fail("package %s is unavailable for %s in %s", name, system.machine, directory);
     return result;
 }
@@ -83,4 +86,31 @@ void repo_search(const char *directory, const char *filter)
         free(path);
     }
     closedir(dir);
+}
+
+void repo_index(const char *directory)
+{
+    DIR *dir = open_repo(directory);
+    fputs(INDEX_HEADER, stdout);
+    for (struct dirent *entry; (entry = next_package(dir)); ) {
+        if (!repo_filename(entry->d_name))
+            fail("invalid repository filename: %s", entry->d_name);
+        char *path = path_join(directory, entry->d_name);
+        struct package pkg = {0};
+        pkg_read(path, &pkg, -1, true);
+        const char *description = pkg.description ? pkg.description : "";
+        if (strpbrk(description, "\t\r\033") ||
+            strlen(description) + strlen(entry->d_name) + strlen(pkg.name) +
+            strlen(pkg.version) + strlen(pkg.arch) + 71 > PATH_MAX)
+            fail("description cannot be indexed: %s", entry->d_name);
+        char digest[65];
+        file_digest(path, digest);
+        printf("%s\t%s\t%s\t%s\t%s\t%s\n", pkg.name, pkg.version, pkg.arch,
+               digest, entry->d_name, description);
+        pkg_free(&pkg);
+        free(path);
+    }
+    closedir(dir);
+    if (fflush(stdout) != 0)
+        syserror("write", "repository index");
 }

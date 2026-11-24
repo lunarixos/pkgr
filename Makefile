@@ -7,7 +7,7 @@ PREFIX ?= /usr/local
 CPPFLAGS += -D_GNU_SOURCE $(ARCHIVE_CFLAGS)
 CFLAGS += -std=c17 -Wall -Wextra -Wpedantic -MMD -MP
 SOURCE_DIR ?= $(if $(wildcard src/main.c),src,tests/src)
-SOURCES = $(addprefix $(SOURCE_DIR)/,main.c package.c database.c repository.c)
+SOURCES = $(addprefix $(SOURCE_DIR)/,main.c package.c database.c repository.c install.c remote.c source.c)
 OBJECTS = $(SOURCES:.c=.o)
 
 .PHONY: all check install install-repo clean static

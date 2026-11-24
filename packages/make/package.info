@@ -1,0 +1,4 @@
+name=make
+version=4.4.1-1
+arch=x86_64
+description=GNU Make build utility
